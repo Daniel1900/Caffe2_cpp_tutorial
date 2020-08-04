@@ -1,0 +1,160 @@
+#include <caffe2/core/init.h>
+#include <caffe2/core/net.h>
+#include <caffe2/utils/proto_utils.h>
+#include "caffe2/util/blob.h"
+#include "caffe2/util/tensor.h"
+#include "caffe2/zoo/keeper.h"
+
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
+#include <fstream>
+
+C10_DEFINE_string(init_net, "res/squeezenet_init_net.pb",
+                     "The given path to the init protobuffer.");
+C10_DEFINE_string(predict_net, "res/squeezenet_predict_net.pb",
+                     "The given path to the predict protobuffer.");
+C10_DEFINE_string(file, "res/image_file.jpg", "The image file.");
+C10_DEFINE_string(classes, "res/imagenet_classes.txt", "The classes file.");
+C10_DEFINE_int(size, 227, "The image file.");
+
+namespace caffe2 {
+
+void run() {
+  std::cout << std::endl;
+  std::cout << "## Caffe2 Loading Pre-Trained Models Tutorial ##" << std::endl;
+  std::cout << "https://caffe2.ai/docs/zoo.html" << std::endl;
+  std::cout << "https://caffe2.ai/docs/tutorial-loading-pre-trained-models.html"
+            << std::endl;
+  std::cout << "https://caffe2.ai/docs/tutorial-image-pre-processing.html"
+            << std::endl;
+  std::cout << std::endl;
+
+  if (!std::ifstream(FLAGS_init_net).good() ||
+      !std::ifstream(FLAGS_predict_net).good()) {
+    std::cerr << "error: Squeezenet model file missing: "
+              << (std::ifstream(FLAGS_init_net).good() ? FLAGS_predict_net
+                                                       : FLAGS_init_net)
+              << std::endl;
+    std::cerr << "Make sure to first run ./script/download_resource.sh"
+              << std::endl;
+    return;
+  }
+
+  if (!std::ifstream(FLAGS_file).good()) {
+    std::cerr << "error: Image file missing: " << FLAGS_file << std::endl;
+    return;
+  }
+
+  if (!std::ifstream(FLAGS_classes).good()) {
+    std::cerr << "error: Classes file invalid: " << FLAGS_classes << std::endl;
+    return;
+  }
+
+  std::cout << "init-net: " << FLAGS_init_net << std::endl;
+  std::cout << "predict-net: " << FLAGS_predict_net << std::endl;
+  std::cout << "file: " << FLAGS_file << std::endl;
+  std::cout << "size: " << FLAGS_size << std::endl;
+
+  std::cout << std::endl;
+
+  // >>> img =
+  // skimage.img_as_float(skimage.io.imread(IMAGE_LOCATION)).astype(np.float32)
+  auto image = cv::imread(FLAGS_file);  // CV_8UC3
+  std::cout << "image size: " << image.size() << std::endl;
+
+  // scale image to fit
+  cv::Size scale(std::max(FLAGS_size * image.cols / image.rows, FLAGS_size),
+                 std::max(FLAGS_size, FLAGS_size * image.rows / image.cols));
+  cv::resize(image, image, scale);
+  std::cout << "scaled size: " << image.size() << std::endl;
+
+  // crop image to fit
+  cv::Rect crop((image.cols - FLAGS_size) / 2, (image.rows - FLAGS_size) / 2,
+                FLAGS_size, FLAGS_size);
+  image = image(crop);
+  std::cout << "cropped size: " << image.size() << std::endl;
+
+  // convert to float, normalize to mean 128
+  image.convertTo(image, CV_32FC3, 1.0, -128);
+  std::cout << "value range: ("
+            << *std::min_element((float *)image.datastart,
+                                 (float *)image.dataend)
+            << ", "
+            << *std::max_element((float *)image.datastart,
+                                 (float *)image.dataend)
+            << ")" << std::endl;
+
+  // convert NHWC to NCHW
+  vector<cv::Mat> channels(3);
+  cv::split(image, channels);
+  std::vector<float> data;
+  for (auto &c : channels) {
+    data.insert(data.end(), (float *)c.datastart, (float *)c.dataend);
+  }
+  std::vector<int64_t> dims({1, image.channels(), image.rows, image.cols});
+
+  TensorCPU tensor(dims, CPU);
+  for(int i = 0; i < data.size(); i++)
+  {
+    tensor.mutable_data<float>()[i] = data[i];
+  }
+
+  // Load Squeezenet model
+  NetDef init_net, predict_net;
+
+  // >>> with open(path_to_INIT_NET) as f:
+  CAFFE_ENFORCE(ReadProtoFromFile(FLAGS_init_net, &init_net));
+
+  // >>> with open(path_to_PREDICT_NET) as f:
+  CAFFE_ENFORCE(ReadProtoFromFile(FLAGS_predict_net, &predict_net));
+
+  // >>> p = workspace.Predictor(init_net, predict_net)
+  Workspace workspace("tmp");
+  CAFFE_ENFORCE(workspace.RunNetOnce(init_net));
+  auto input = workspace.CreateBlob("data")->GetMutable<TensorCPU>();
+  input->ResizeLike(tensor);
+  input->ShareData(tensor);
+  CAFFE_ENFORCE(workspace.RunNetOnce(predict_net));
+
+  // >>> results = p.run([img])
+  auto &output_name = predict_net.external_output(0);
+  auto output = workspace.GetBlob(output_name)->Get<TensorCPU>();
+
+  // sort top results
+  const auto &probs = output.data<float>();
+  std::vector<std::pair<int, int>> pairs;
+  for (auto i = 0; i < output.size(); i++) {
+    if (probs[i] > 0.01) {
+      pairs.push_back(std::make_pair(probs[i] * 100, i));
+    }
+  }
+
+  std::sort(pairs.begin(), pairs.end());
+
+  std::cout << std::endl;
+
+  // read classes
+  std::ifstream file(FLAGS_classes);
+  std::string temp;
+  std::vector<std::string> classes;
+  while (std::getline(file, temp)) {
+    classes.push_back(temp);
+  }
+
+  // show results
+  std::cout << "output: " << std::endl;
+  for (auto pair : pairs) {
+    std::cout << "  " << pair.first << "% '" << classes[pair.second] << "' ("
+              << pair.second << ")" << std::endl;
+  }
+}
+
+}  // namespace caffe2
+
+int main(int argc, char **argv) {
+  caffe2::GlobalInit(&argc, &argv);
+  caffe2::run();
+  google::protobuf::ShutdownProtobufLibrary();
+  return 0;
+}
